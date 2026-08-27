@@ -19,6 +19,7 @@ import type {
 
 const RESULT_TRUNCATE_LIMIT = 10_000
 const L1_RESPONSE_LIMIT = 150_000
+const COMPACTION_SUMMARY_PREVIEW = 400
 
 // -- Helpers ------------------------------------------------------------------
 
@@ -29,6 +30,8 @@ function extractUserMessageText(userMessage: UserContent | null): string | null 
   for (const block of userMessage) {
     if (block.type === "text") parts.push(block.text)
     else if (block.type === "image") parts.push("[image attached]")
+    else if (block.type === "document") parts.push("[document attached]")
+    else if (block.type === "audio") parts.push("[audio attached]")
   }
   return parts.length > 0 ? parts.join("\n") : null
 }
@@ -127,8 +130,16 @@ function mapTurnToSummary(turn: Turn, turnIndex: number) {
     subAgents,
     hasThinking: turn.thinking.length > 0,
     isError: turn.toolCalls.some((tc) => tc.isError),
-    compactionSummary: turn.compactionSummary ?? null,
+    compactionSummary: truncateCompactionSummary(turn.compactionSummary),
   }
+}
+
+/** L1 lists every turn, so the full summary goes out at L2 instead. */
+function truncateCompactionSummary(summary: string | undefined): string | null {
+  if (!summary) return null
+  return summary.length > COMPACTION_SUMMARY_PREVIEW
+    ? summary.slice(0, COMPACTION_SUMMARY_PREVIEW) + "... [truncated, use L2 for full text]"
+    : summary
 }
 
 // -- L2: Turn Detail ----------------------------------------------------------
@@ -142,6 +153,7 @@ function mapTurnToDetail(session: ParsedSession, turnIndex: number) {
     sessionId: session.sessionId,
     turnIndex,
     userMessage: extractUserMessageText(turn.userMessage),
+    compactionSummary: turn.compactionSummary ?? null,
     contentBlocks,
     tokenUsage: turn.tokenUsage
       ? { input: turn.tokenUsage.input_tokens, output: turn.tokenUsage.output_tokens }
@@ -149,6 +161,11 @@ function mapTurnToDetail(session: ParsedSession, turnIndex: number) {
     model: turn.model,
     durationMs: turn.durationMs,
   }
+}
+
+function mapToolCall(tc: Turn["toolCalls"][number]) {
+  const { result, resultTruncated } = truncateResult(tc.result)
+  return { id: tc.id, name: tc.name, input: tc.input, result, resultTruncated, isError: tc.isError }
 }
 
 function mapContentBlock(block: TurnContentBlock) {
@@ -165,10 +182,7 @@ function mapContentBlock(block: TurnContentBlock) {
     case "tool_calls":
       return {
         kind: "tool_calls" as const,
-        toolCalls: block.toolCalls.map((tc) => {
-          const { result, resultTruncated } = truncateResult(tc.result)
-          return { id: tc.id, name: tc.name, input: tc.input, result, resultTruncated, isError: tc.isError }
-        }),
+        toolCalls: block.toolCalls.map(mapToolCall),
         timestamp: block.timestamp ?? null,
       }
     case "sub_agent":
@@ -178,6 +192,35 @@ function mapContentBlock(block: TurnContentBlock) {
         agents: block.messages.map(mapSubAgentDetail),
         timestamp: block.timestamp ?? null,
       }
+    case "queued_prompt":
+      return { kind: "queued_prompt" as const, content: block.content, timestamp: block.timestamp ?? null }
+    case "agent_message":
+      return {
+        kind: "agent_message" as const,
+        sender: block.sender,
+        body: block.body,
+        reply: block.reply ?? null,
+        timestamp: block.timestamp ?? null,
+      }
+    case "hook_event":
+      return { kind: "hook_event" as const, events: block.events, timestamp: block.timestamp ?? null }
+    case "plan_mode":
+      return {
+        kind: "plan_mode" as const,
+        plan: block.plan,
+        planFilePath: block.planFilePath ?? null,
+        status: block.status,
+        toolCalls: block.toolCalls.map(mapToolCall),
+        timestamp: block.timestamp ?? null,
+      }
+    case "recap":
+      return { kind: "recap" as const, content: block.content, timestamp: block.timestamp ?? null }
+    default: {
+      // Exhaustiveness guard: a new TurnContentBlock kind must fail typecheck here
+      // rather than silently serializing as undefined and vanishing from the response.
+      const exhaustive: never = block
+      return exhaustive
+    }
   }
 }
 
@@ -353,7 +396,6 @@ export async function getAgentTurnDetail(
 ): Promise<object> {
   const jsonlPath = await findJsonlPath(sessionId)
   if (!jsonlPath) return { error: "Session not found" }
-  const content = await readFile(jsonlPath, "utf-8")
 
   const subagentFile = await findSubagentFile(jsonlPath, agentId)
   if (!subagentFile) return { error: "Agent not found" }

@@ -1,23 +1,22 @@
+// SHARED SESSION CORE: edit shared/session only; cogpit-memory copies are generated.
 import type {
   RawMessage,
   ParsedSession,
   ContentBlock,
   ImageBlock,
-  AssistantMessage,
+  ParseSessionOptions,
   UserContent,
 } from "./types"
-import { buildTurns } from "./turnBuilder"
-import { computeStats } from "./sessionStats"
+import { buildTurns, findTurnStartIndices, pairAgentMessageReplies } from "./turnBuilder"
+import { computeStats, createEmptySessionStats } from "./sessionStats"
 import { isCodexSessionText, parseCodexSession } from "./codex"
+import { isAssistantMessage } from "./messageTypeGuards"
 
 export type { PendingInteraction } from "./interactiveState"
+export type { ParseSessionOptions } from "./types"
 export { detectPendingInteraction } from "./interactiveState"
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-function isAssistantMessage(msg: RawMessage): msg is AssistantMessage {
-  return msg.type === "assistant"
-}
 
 function extractTextFromContent(content: string | ContentBlock[]): string {
   if (typeof content === "string") return content
@@ -49,6 +48,9 @@ function isCodexRawMessages(rawMessages: Array<{ type: string; [key: string]: un
     || firstType === "turn_context"
     || firstType === "event_msg"
     || firstType === "response_item"
+    || firstType === "compacted"
+    || firstType === "world_state"
+    || firstType === "inter_agent_communication_metadata"
 }
 
 function serializeRawMessages(rawMessages: Array<{ type: string; [key: string]: unknown }>): string {
@@ -56,7 +58,7 @@ function serializeRawMessages(rawMessages: Array<{ type: string; [key: string]: 
 }
 
 function extractSessionMetadata(messages: RawMessage[]) {
-  const meta = { sessionId: "", version: "", gitBranch: "", cwd: "", slug: "", model: "", branchedFrom: undefined as { sessionId: string; turnIndex?: number | null } | undefined }
+  const meta = { sessionId: "", version: "", gitBranch: "", cwd: "", slug: "", name: "", model: "", branchedFrom: undefined as { sessionId: string; turnIndex?: number | null } | undefined }
 
   for (const msg of messages) {
     if (msg.sessionId && !meta.sessionId) meta.sessionId = msg.sessionId
@@ -64,6 +66,7 @@ function extractSessionMetadata(messages: RawMessage[]) {
     if (msg.gitBranch && !meta.gitBranch) meta.gitBranch = msg.gitBranch
     if (msg.cwd && !meta.cwd) meta.cwd = msg.cwd
     if (msg.slug && !meta.slug) meta.slug = msg.slug
+    if ((msg as Record<string, unknown>).name && !meta.name) meta.name = (msg as Record<string, unknown>).name as string
     if ((msg as Record<string, unknown>).branchedFrom && !meta.branchedFrom) {
       meta.branchedFrom = (msg as Record<string, unknown>).branchedFrom as typeof meta.branchedFrom
     }
@@ -78,20 +81,20 @@ function extractSessionMetadata(messages: RawMessage[]) {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-export function parseSession(jsonlText: string): ParsedSession {
+export function parseSession(jsonlText: string, options?: ParseSessionOptions): ParsedSession {
   if (isCodexSessionText(jsonlText)) {
-    return parseCodexSession(jsonlText)
+    return parseCodexSession(jsonlText, options)
   }
   const rawMessages = parseLines(jsonlText)
   const metadata = extractSessionMetadata(rawMessages)
   const turns = buildTurns(rawMessages)
-  const stats = computeStats(turns)
+  const stats = options?.skipStats ? createEmptySessionStats(turns.length) : computeStats(turns)
 
   return {
     ...metadata,
     turns,
     stats,
-    rawMessages,
+    rawMessages: options?.skipStats ? [] : rawMessages,
     agentKind: "claude" as const,
   }
 }
@@ -113,84 +116,53 @@ export function parseSessionAppend(
   const newMessages = parseLines(newJsonlText)
   if (newMessages.length === 0) return existing
 
-  const allRawMessages = [...existing.rawMessages, ...newMessages]
+  // The Codex path returns above, so the remaining raw records use Claude's
+  // discriminated message union and are safe to pass to the Claude turn builder.
+  const existingRawMessages = existing.rawMessages as RawMessage[]
+  const allRawMessages = [...existingRawMessages, ...newMessages]
 
-  // Find the raw message index where the last existing turn started.
-  // We pop the last turn and re-build from that point forward.
-  // This way, even for a 500-turn session, we only re-process ~1 turn's worth of messages.
-  let lastTurnStartIdx = existing.rawMessages.length // default: start of new messages
-  let turnsToKeep = existing.turns.length > 0 ? existing.turns.length - 1 : 0
-  if (existing.turns.length > 0) {
-    // Walk backwards through existing raw messages to find the last non-meta
-    // user message (which starts a turn)
-    let userMsgCount = 0
-    for (let i = existing.rawMessages.length - 1; i >= 0; i--) {
-      const msg = existing.rawMessages[i]
-      if (msg.type === "user" && !msg.isMeta) {
-        const content = msg.message?.content
-        // Skip tool-result user messages
-        if (Array.isArray(content) && content.some((b: { type: string }) => b.type === "tool_result")) {
-          continue
-        }
-        userMsgCount++
-        if (userMsgCount === 1) {
-          lastTurnStartIdx = i
-          break
-        }
-      }
+  // Only the last turn can still change, so keep every turn before it and
+  // rebuild from where it started. Both the cut point and the keep-count come
+  // from `turnStarts` so they cannot disagree — even for a window that begins
+  // mid-turn (bottom-first loading) and therefore has no turn-starting user
+  // record to walk back to.
+  const turnStarts = findTurnStartIndices(existingRawMessages)
+  // Turns paged in above the loaded window have no raw messages behind them.
+  const historyTurnCount = Math.max(0, existing.turns.length - turnStarts.length)
+  let rebuildFromTurn = Math.max(0, turnStarts.length - 1)
+
+  // Claude Code can flush sub-agent progress events AFTER the parent turn's
+  // tool_result and even after the next turn has started. When that happens we
+  // rebuild from the turn that owns the tool call so the sub-agent content
+  // block lands in the correct turn.
+  const progressParentIds = new Set<string>()
+  for (const msg of newMessages) {
+    if (msg.type === "progress") {
+      const parentId = (msg as typeof newMessages[0] & { parentToolUseID?: string }).parentToolUseID
+      if (parentId) progressParentIds.add(parentId)
     }
+  }
 
-    // Check if new messages include progress events whose parentToolUseID
-    // belongs to an earlier turn (not the last one being rebuilt).  Claude
-    // Code can flush sub-agent progress events AFTER the parent turn's
-    // tool_result and even after the next turn has started.  When that
-    // happens we need to rebuild from the turn that owns the tool call so
-    // the sub-agent content block lands in the correct turn.
-    const progressParentIds = new Set<string>()
-    for (const msg of newMessages) {
-      if (msg.type === "progress") {
-        const parentId = (msg as typeof newMessages[0] & { parentToolUseID?: string }).parentToolUseID
-        if (parentId) progressParentIds.add(parentId)
-      }
-    }
-
-    if (progressParentIds.size > 0) {
-      // Walk earlier turns to see if any own the referenced tool calls
-      for (let t = existing.turns.length - 2; t >= 0; t--) {
-        const turn = existing.turns[t]
-        const ownsProgressParent = turn.toolCalls.some((tc) => progressParentIds.has(tc.id))
-        if (ownsProgressParent) {
-          // Need to rebuild from this earlier turn.  Find its start in rawMessages.
-          turnsToKeep = t
-          let found = 0
-          for (let i = 0; i < existing.rawMessages.length; i++) {
-            const msg = existing.rawMessages[i]
-            if (msg.type === "user" && !msg.isMeta) {
-              const content = msg.message?.content
-              if (Array.isArray(content) && content.some((b: { type: string }) => b.type === "tool_result")) {
-                continue
-              }
-              if (found === t) {
-                lastTurnStartIdx = i
-                break
-              }
-              found++
-            }
-          }
-          break
-        }
+  if (progressParentIds.size > 0) {
+    for (let t = rebuildFromTurn - 1; t >= 0; t--) {
+      const turn = existing.turns[historyTurnCount + t]
+      if (turn?.toolCalls.some((tc) => progressParentIds.has(tc.id))) {
+        rebuildFromTurn = t
+        break
       }
     }
   }
 
-  // Keep all turns before the rebuild point
-  const keptTurns = existing.turns.slice(0, turnsToKeep)
+  // With no turns in the window at all, there is nothing to rebuild — parse
+  // the new messages on their own and keep everything already known.
+  const rebuildFrom = turnStarts[rebuildFromTurn] ?? existingRawMessages.length
+  const keptTurns = existing.turns.slice(0, historyTurnCount + rebuildFromTurn)
+  const tailTurns = buildTurns(allRawMessages.slice(rebuildFrom))
 
-  // Re-build turns from the last turn's start through all new messages
-  const tailMessages = allRawMessages.slice(lastTurnStartIdx)
-  const tailTurns = buildTurns(tailMessages)
-
-  const allTurns = [...keptTurns, ...tailTurns]
+  // Only the rebuilt tail passed through pairing, and it cannot see the kept
+  // turns above it — so a peer message two or more turns back would lose the
+  // reply it already had the moment the next line lands.
+  const allTurns = pairAgentMessageReplies([...keptTurns, ...tailTurns])
   const stats = computeStats(allTurns)
 
   // Preserve metadata from existing (already extracted)
@@ -200,11 +172,13 @@ export function parseSessionAppend(
     gitBranch: existing.gitBranch,
     cwd: existing.cwd,
     slug: existing.slug,
+    name: existing.name,
     model: existing.model || (allTurns.length > 0 ? allTurns[allTurns.length - 1].model || "" : ""),
     turns: allTurns,
     stats,
     rawMessages: allRawMessages,
     branchedFrom: existing.branchedFrom,
+    agentKind: existing.agentKind,
   }
 }
 
@@ -221,23 +195,20 @@ export function getUserMessageImages(content: UserContent | null): ImageBlock[] 
 
 // ── Tool Colors ─────────────────────────────────────────────────────────────
 
-const TOOL_COLORS: Record<string, string> = {
-  Read: "text-blue-400",
-  Write: "text-green-400",
-  Edit: "text-amber-400",
-  Bash: "text-red-400",
-  Grep: "text-purple-400",
-  Glob: "text-cyan-400",
-  Task: "text-indigo-400", // @deprecated pre-v2.1.63, now "Agent"
-  Agent: "text-indigo-400",
-  WebFetch: "text-orange-400",
-  WebSearch: "text-orange-400",
-  NotebookEdit: "text-green-400",
-  EnterPlanMode: "text-purple-400",
-  ExitPlanMode: "text-purple-400",
-  AskUserQuestion: "text-pink-400",
-}
+const FOREGROUND_TOOLS = new Set([
+  "Write",
+  "Edit",
+  "Bash",
+  "Task", // @deprecated pre-v2.1.63, now "Agent"
+  "Agent",
+  "NotebookEdit",
+  "AskUserQuestion",
+  "TodoWrite",
+  "Skill",
+  "Image",
+  "exec",
+])
 
 export function getToolColor(toolName: string): string {
-  return TOOL_COLORS[toolName] ?? "text-slate-400"
+  return FOREGROUND_TOOLS.has(toolName) ? "text-foreground" : "text-muted-foreground"
 }

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os"
 // Use a mutable object so updates in beforeEach are visible through the
 // captured import reference.
 let tmpDir: string
-const mockDirs = { PROJECTS_DIR: "", TEAMS_DIR: "", TASKS_DIR: "" }
+const mockDirs = { PROJECTS_DIR: "", TEAMS_DIR: "", TASKS_DIR: "", CODEX_SESSIONS_DIR: "" }
 
 mock.module("../../lib/dirs", () => ({
   dirs: mockDirs,
@@ -69,6 +69,7 @@ describe("sessions command", () => {
     mockDirs.PROJECTS_DIR = projectsDir
     mockDirs.TEAMS_DIR = join(projectsDir, "..", "teams")
     mockDirs.TASKS_DIR = join(projectsDir, "..", "tasks")
+    mockDirs.CODEX_SESSIONS_DIR = join(tmpDir, "codex-sessions")
   })
 
   afterEach(() => {
@@ -146,14 +147,6 @@ describe("sessions command", () => {
       // "1m" means 1 minute -- a freshly written file should pass
       const result = await listSessions({ maxAge: "1m" })
       expect(result.length).toBe(1)
-
-      // "0m" is invalid, falls back to 5d default, so recent files still pass
-      const result2 = await listSessions({ maxAge: "0m" })
-      // 0m = 0 ms, everything is filtered out (cutoff = Date.now())
-      // Actually "0m" -> 0*60*1000 = 0ms, cutoff = Date.now(), so nothing passes
-      // wait, parseMaxAge("0m") = 0, cutoff = Date.now() - 0 = Date.now()
-      // mtimeMs < Date.now() => filtered out for just-written files
-      // This is correct behavior
     })
 
     it("each session has the expected shape", async () => {
@@ -264,6 +257,17 @@ describe("sessions command", () => {
       expect(result!).toHaveProperty("status")
       expect(result!).toHaveProperty("mtime")
       expect(typeof result!.mtime).toBe("number")
+    })
+
+    it("handles a Windows cwd", async () => {
+      // CWD "C:\\Users\\me\\proj" -> dir name "C--Users-me-proj"
+      const projDir = join(mockDirs.PROJECTS_DIR, "C--Users-me-proj")
+      mkdirSync(projDir, { recursive: true })
+      writeSession(projDir, "winpath.jsonl", { cwd: "C:\\Users\\me\\proj" })
+
+      const result = await currentSession("C:\\Users\\me\\proj")
+      expect(result).not.toBeNull()
+      expect(result!.sessionId).toBe("winpath")
     })
 
     it("handles dots in the cwd path", async () => {

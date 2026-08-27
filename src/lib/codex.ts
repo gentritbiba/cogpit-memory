@@ -1,11 +1,35 @@
-import { computeStats } from "./sessionStats"
+// SHARED SESSION CORE: edit shared/session only; cogpit-memory copies are generated.
+import { computeStats, createEmptySessionStats } from "./sessionStats"
+import {
+  findFailedNestedPatchCallIds,
+  parseCodexToolPatches,
+} from "./codex-patches"
+import {
+  inferToolError,
+  normalizeFunctionName,
+  normalizePlanToTodos,
+  parseCustomToolOutput,
+} from "./codex-tool-normalization"
 import type {
+  AudioBlock,
+  ContentBlock,
+  ImageBlock,
+  ParseSessionOptions,
   ParsedSession,
+  SubAgentMessage,
   ThinkingBlock,
   TokenUsage,
   ToolCall,
   Turn,
 } from "./types"
+
+export {
+  extractApplyPatchInputs,
+  findFailedNestedPatchCallIds,
+  parseApplyPatch,
+  parseCodexToolPatches,
+} from "./codex-patches"
+export { parseCustomToolOutput } from "./codex-tool-normalization"
 
 interface CodexRecord {
   timestamp?: string
@@ -20,15 +44,24 @@ interface CodexMetadata {
   cwd: string
   model: string
   slug: string
+  name: string
   branchedFrom?: { sessionId: string; turnIndex?: number | null }
   firstUserMessage: string
   lastUserMessage: string
   timestamp: string
   lastTimestamp: string
   turnCount: number
+  /** True when this session is a Codex sub-agent (spawned by spawn_agent) */
+  isSubagent: boolean
+  /** Parent session ID for sub-agent sessions */
+  parentSessionId: string | null
+  /** Canonical collaboration path for the agent that owns this rollout. */
+  agentPath: string
 }
 
 const SKIP_PROMPT_PREFIXES = [
+  "# AGENTS.md instructions for ",
+  "<recommended_plugins>",
   "<environment_context>",
   "<permissions instructions>",
   "<collaboration_mode>",
@@ -57,6 +90,9 @@ function isCodexRecord(record: CodexRecord | null): record is CodexRecord {
     || record.type === "turn_context"
     || record.type === "event_msg"
     || record.type === "response_item"
+    || record.type === "inter_agent_communication_metadata"
+    || record.type === "compacted"
+    || record.type === "world_state"
 }
 
 function extractMessageText(payload: Record<string, unknown> | undefined, blockType: "input_text" | "output_text"): string {
@@ -67,6 +103,128 @@ function extractMessageText(payload: Record<string, unknown> | undefined, blockT
     .map((block) => block.text as string)
     .join("\n")
     .trim()
+}
+
+const CODEX_IMAGE_DATA_URL = /^data:(image\/(?:png|jpeg|gif|webp));base64,(.+)$/is
+const CODEX_AUDIO_DATA_URL = /^data:(audio\/(?:wav|x-wav|mpeg|mp4|webm|ogg));base64,(.+)$/is
+
+function parseImageDataUrl(value: unknown): ImageBlock | null {
+  if (typeof value !== "string") return null
+  const match = CODEX_IMAGE_DATA_URL.exec(value)
+  if (!match?.[1] || !match[2]) return null
+  return {
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: match[1].toLowerCase(),
+      data: match[2],
+    },
+  }
+}
+
+function parseAudioDataUrl(value: unknown): AudioBlock | null {
+  if (typeof value !== "string") return null
+  const match = CODEX_AUDIO_DATA_URL.exec(value)
+  if (!match?.[1] || !match[2]) return null
+  return {
+    type: "audio",
+    source: {
+      type: "base64",
+      media_type: match[1].toLowerCase(),
+      data: match[2],
+    },
+  }
+}
+
+function extractEventMessageImages(payload: Record<string, unknown>): ImageBlock[] {
+  if (!Array.isArray(payload.images)) return []
+  return payload.images
+    .map(parseImageDataUrl)
+    .filter((image): image is ImageBlock => image !== null)
+}
+
+function extractEventMessageAudio(payload: Record<string, unknown>): AudioBlock[] {
+  if (!Array.isArray(payload.audio)) return []
+  return payload.audio
+    .map(parseAudioDataUrl)
+    .filter((audio): audio is AudioBlock => audio !== null)
+}
+
+function extractResponseMessageImages(payload: Record<string, unknown>): ImageBlock[] {
+  if (!Array.isArray(payload.content)) return []
+  return payload.content
+    .filter((block): block is Record<string, unknown> => (
+      isObject(block) && block.type === "input_image"
+    ))
+    .map((block) => parseImageDataUrl(block.image_url))
+    .filter((image): image is ImageBlock => image !== null)
+}
+
+function extractResponseMessageAudio(payload: Record<string, unknown>): AudioBlock[] {
+  if (!Array.isArray(payload.content)) return []
+  return payload.content
+    .filter((block): block is Record<string, unknown> => (
+      isObject(block) && block.type === "input_audio"
+    ))
+    .map((block) => parseAudioDataUrl(block.audio_url))
+    .filter((audio): audio is AudioBlock => audio !== null)
+}
+
+function buildCodexUserContent(
+  message: string,
+  images: ImageBlock[],
+  audio: AudioBlock[] = [],
+  localImages: string[] = [],
+  localAudio: string[] = [],
+): string | ContentBlock[] {
+  const attachmentSuffix = [
+    ...localImages.map((path) => `\n![image](<${path}>)`),
+    ...localAudio.map((path) => `\n[audio attachment](<${path}>)`),
+  ].join("")
+  const text = message + attachmentSuffix
+  if (images.length === 0 && audio.length === 0) return text
+  return [
+    ...images,
+    ...audio,
+    ...(text ? [{ type: "text" as const, text }] : []),
+  ]
+}
+
+interface InterAgentMessage {
+  messageType: string | null
+  text: string
+}
+
+function extractInterAgentMessage(payload: Record<string, unknown>): InterAgentMessage {
+  const rawText = extractMessageText(payload, "input_text")
+  if (!rawText) return { messageType: null, text: "" }
+
+  // Multi-agent messages use a small plaintext routing envelope. Only the
+  // payload belongs in the transcript; routing metadata is already represented
+  // by author/recipient fields on the response item.
+  const headerEnd = rawText.match(/\r?\nPayload:\s*(?:\r?\n|$)/)
+  if (!rawText.startsWith("Message Type:") || !headerEnd || headerEnd.index === undefined) {
+    return { messageType: null, text: rawText.trim() }
+  }
+
+  const header = rawText.slice(0, headerEnd.index)
+  const messageType = header.match(/^Message Type:\s*([^\r\n]+)/)?.[1]?.trim().toUpperCase() ?? null
+  const text = rawText.slice(headerEnd.index + headerEnd[0].length).trim()
+  return { messageType, text }
+}
+
+function agentNameFromPath(agentPath: string): string | null {
+  const segments = agentPath.split(/[\\/]/).filter(Boolean)
+  return segments.at(-1) ?? null
+}
+
+function readableAgentPrompt(value: unknown): string {
+  if (typeof value !== "string") return ""
+  const prompt = value.trim()
+  // Codex 0.144 encrypts delegated task payloads in persisted rollouts. Do not
+  // surface that ciphertext as if it were the human-readable agent prompt.
+  if (/^gAAAAA[A-Za-z0-9_-]+$/.test(prompt)) return ""
+  return prompt
 }
 
 function normalizePromptText(text: string): string {
@@ -90,10 +248,22 @@ function mergeTokenUsage(existing: TokenUsage | null, incoming: TokenUsage): Tok
 
 function parseTokenUsage(value: unknown): TokenUsage | null {
   if (!isObject(value)) return null
-  const inputTokens = typeof value.input_tokens === "number" ? value.input_tokens : 0
+  const reportedInputTokens = typeof value.input_tokens === "number" ? value.input_tokens : 0
   const outputTokens = typeof value.output_tokens === "number" ? value.output_tokens : 0
-  const cacheCreation = typeof value.cache_creation_input_tokens === "number" ? value.cache_creation_input_tokens : 0
-  const cacheRead = typeof value.cache_read_input_tokens === "number" ? value.cache_read_input_tokens : 0
+  const cacheCreation = typeof value.cache_write_input_tokens === "number"
+    ? value.cache_write_input_tokens
+    : typeof value.cache_creation_input_tokens === "number" ? value.cache_creation_input_tokens : 0
+  const nativeCachedInput = typeof value.cached_input_tokens === "number"
+    ? Math.max(0, value.cached_input_tokens)
+    : null
+  const cacheRead = nativeCachedInput
+    ?? (typeof value.cache_read_input_tokens === "number" ? value.cache_read_input_tokens : 0)
+  // Codex reports input_tokens inclusive of cached input. TokenUsage follows
+  // the Anthropic-shaped split used by the rest of Cogpit, where input_tokens
+  // is uncached and cache_read_input_tokens is tracked separately.
+  const inputTokens = nativeCachedInput === null
+    ? reportedInputTokens
+    : Math.max(0, reportedInputTokens - nativeCachedInput)
   if (inputTokens === 0 && outputTokens === 0 && cacheCreation === 0 && cacheRead === 0) return null
   return {
     input_tokens: inputTokens,
@@ -142,6 +312,7 @@ function finalizeTurn(turns: Turn[], current: Turn | null, lastTimestamp: string
     || current.assistantText.length > 0
     || current.toolCalls.length > 0
     || current.thinking.length > 0
+    || current.subAgentActivity.length > 0
   if (!hasContent) return null
 
   if (current.timestamp && lastTimestamp) {
@@ -166,16 +337,53 @@ function parseToolInput(argumentsText: unknown): Record<string, unknown> {
   }
 }
 
-function inferToolError(output: string | null): boolean {
-  if (!output) return false
-  const exitMatch = output.match(/Process exited with code (\d+)/)
-  if (exitMatch) return exitMatch[1] !== "0"
-  return /\b(error|failed|exception)\b/i.test(output)
+function safeStringify(value: unknown): string {
+  if (typeof value === "string") return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value ?? "")
+  }
 }
 
+function findString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string")
+}
+
+/** Code mode nests operations inside an `exec` script, which renders them itself. */
+function isCodeModeChild(callId: string): boolean {
+  return callId.startsWith("exec-")
+}
+
+function parseMcpEventResult(value: unknown): { text: string; isError: boolean } {
+  if (!isObject(value)) return { text: safeStringify(value), isError: false }
+  if ("Err" in value) return { text: safeStringify(value.Err), isError: true }
+  const ok = isObject(value.Ok) ? value.Ok : null
+  if (!ok) return { text: safeStringify(value), isError: false }
+
+  const parsedContent = parseCustomToolOutput(ok.content)
+  const text = parsedContent.text
+    || (ok.structuredContent !== undefined ? safeStringify(ok.structuredContent) : safeStringify(ok))
+  return {
+    text,
+    isError: ok.isError === true || parsedContent.isError,
+  }
+}
+
+/**
+ * Codex reuses one `turn_id` across every `turn_context` record it writes for
+ * a thread, so a post-compaction segment carries the same id as the segment
+ * that preceded it. Qualifying the id with the turn's opening timestamp keeps
+ * it unique per segment and stable across full and paged parses — timeline
+ * paging deduplicates by turn id, and a collision there silently discards the
+ * older page's turn along with its prompt.
+ *
+ * A turn Codex never labelled falls back to a random id, which is stable
+ * within one parse but not across them.
+ */
 function createTurn(turnId: string | null, timestamp: string, model: string | null): Turn {
   return {
-    id: turnId || randomTurnId("codex-turn"),
+    id: turnId ? `${turnId}@${timestamp}` : randomTurnId("codex-turn"),
     userMessage: null,
     contentBlocks: [],
     thinking: [],
@@ -199,6 +407,29 @@ function extractPromptFromRecord(record: CodexRecord): string {
   return ""
 }
 
+/**
+ * Whether a record may open a turn when none is active.
+ *
+ * Session metadata and instruction records carry no turn content, but every
+ * paged read prepends the file header, so letting them open a turn would stamp
+ * each page's leading turn with the session-start timestamp and inflate its
+ * duration. Records that only ever attach to an existing turn are unaffected:
+ * this is consulted only when no turn is open.
+ */
+function recordOpensTurn(record: CodexRecord, payload: Record<string, unknown> | undefined): boolean {
+  if (record.type === "session_meta") return false
+  if (record.type === "event_msg" && payload?.type === "task_started") return false
+  if (record.type === "response_item" && payload?.type === "message") {
+    if (payload.role === "developer" || payload.role === "system") return false
+    if (payload.role === "user") {
+      return extractPromptFromRecord(record) !== ""
+        || extractResponseMessageImages(payload).length > 0
+        || extractResponseMessageAudio(payload).length > 0
+    }
+  }
+  return true
+}
+
 function extractMetadataFromRecords(records: CodexRecord[]): CodexMetadata {
   let sessionId = ""
   let version = ""
@@ -211,6 +442,9 @@ function extractMetadataFromRecords(records: CodexRecord[]): CodexMetadata {
   let timestamp = ""
   let lastTimestamp = ""
   let turnCount = 0
+  let isSubagent = false
+  let parentSessionId: string | null = null
+  let agentPath = "/root"
 
   let previousPrompt = ""
 
@@ -232,6 +466,18 @@ function extractMetadataFromRecords(records: CodexRecord[]): CodexMetadata {
               : null,
           }
         }
+      }
+      // Detect sub-agent sessions via source.subagent
+      const source = isObject(record.payload.source) ? record.payload.source : null
+      if (source && isObject(source.subagent)) {
+        isSubagent = true
+        const threadSpawn = isObject(source.subagent.thread_spawn) ? source.subagent.thread_spawn : null
+        if (threadSpawn && typeof threadSpawn.agent_path === "string") {
+          agentPath = threadSpawn.agent_path
+        }
+      }
+      if (typeof record.payload.forked_from_id === "string" && record.payload.forked_from_id) {
+        parentSessionId = record.payload.forked_from_id
       }
       const git = isObject(record.payload.git) ? record.payload.git : null
       gitBranch ||= git && typeof git.branch === "string" ? git.branch : ""
@@ -262,12 +508,16 @@ function extractMetadataFromRecords(records: CodexRecord[]): CodexMetadata {
     cwd,
     model,
     slug: "",
+    name: "",
     branchedFrom,
     firstUserMessage,
     lastUserMessage,
     timestamp,
     lastTimestamp,
     turnCount,
+    isSubagent,
+    parentSessionId,
+    agentPath,
   }
 }
 
@@ -285,7 +535,7 @@ export function extractCodexMetadataFromLines(lines: string[]) {
   return extractMetadataFromRecords(records)
 }
 
-export function parseCodexSession(jsonlText: string): ParsedSession {
+export function parseCodexSession(jsonlText: string, options?: ParseSessionOptions): ParsedSession {
   const records = jsonlText
     .split("\n")
     .map((line) => line.trim())
@@ -296,21 +546,172 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
   const metadata = extractMetadataFromRecords(records)
   const turns: Turn[] = []
   const pendingToolCalls = new Map<string, ToolCall>()
+  const webSearchCalls = new Map<string, ToolCall>()
+  // apply_patch parent callId → synthetic per-file tool calls
+  const patchCallIds = new Map<string, { calls: ToolCall[]; direct: boolean }>()
+  // spawn_agent call tracking
+  const spawnAgentCalls = new Map<string, {
+    callId: string
+    message: string
+    taskName: string | null
+    model: string | null
+    agentType: string | null
+    timestamp: string
+  }>()
+  type AgentInfo = {
+    agentId: string
+    nickname: string | null
+    agentPath: string | null
+    message: string
+    model: string | null
+    agentType: string | null
+    timestamp: string
+    parentToolCallId: string
+  }
+  // agentId → resolved agent info (from legacy spawn results or 0.144 activity events)
+  const agentRegistry = new Map<string, AgentInfo>()
+  const agentIdByPath = new Map<string, string>()
+  const agentIdBySpawnCall = new Map<string, string>()
+  // One mutable presentation object per agent. Content blocks retain a reference
+  // to this object, so later activity/final-answer records update in place.
+  const agentMessages = new Map<string, { message: SubAgentMessage; turn: Turn }>()
+
+  function upsertAgentMessage(
+    agentId: string,
+    targetTurn: Turn,
+    eventTimestamp: string,
+    update: { status?: string; text?: string } = {},
+  ): SubAgentMessage {
+    const info = agentRegistry.get(agentId)
+    let entry = agentMessages.get(agentId)
+
+    if (!entry) {
+      const agentMessage: SubAgentMessage = {
+        agentId,
+        parentToolUseId: info?.parentToolCallId || undefined,
+        agentName: info?.nickname ?? (info?.agentPath ? agentNameFromPath(info.agentPath) : null),
+        subagentType: info?.agentType ?? null,
+        type: "assistant",
+        content: null,
+        toolCalls: [],
+        thinking: [],
+        text: [],
+        timestamp: info?.timestamp ?? eventTimestamp,
+        tokenUsage: null,
+        model: info?.model ?? null,
+        isBackground: false,
+        prompt: info?.message || undefined,
+        status: update.status ?? "running",
+      }
+      targetTurn.subAgentActivity.push(agentMessage)
+      const lastBlock = targetTurn.contentBlocks[targetTurn.contentBlocks.length - 1]
+      if (lastBlock?.kind === "sub_agent") {
+        lastBlock.messages.push(agentMessage)
+      } else {
+        targetTurn.contentBlocks.push({ kind: "sub_agent", messages: [agentMessage], timestamp: eventTimestamp })
+      }
+      entry = { message: agentMessage, turn: targetTurn }
+      agentMessages.set(agentId, entry)
+    }
+
+    const agentMessage = entry.message
+    if (info) {
+      agentMessage.parentToolUseId = info.parentToolCallId || agentMessage.parentToolUseId
+      agentMessage.agentName = info.nickname ?? (info.agentPath ? agentNameFromPath(info.agentPath) : agentMessage.agentName)
+      agentMessage.subagentType = info.agentType
+      agentMessage.model = info.model
+      agentMessage.prompt = info.message || agentMessage.prompt
+    }
+
+    if (update.text && !agentMessage.text.includes(update.text)) {
+      agentMessage.text.push(update.text)
+      agentMessage.content = agentMessage.text.join("\n\n")
+    }
+
+    if (update.status) {
+      const terminalStatuses = new Set(["completed", "failed", "interrupted"])
+      if (!(update.status === "running" && agentMessage.status && terminalStatuses.has(agentMessage.status))) {
+        agentMessage.status = update.status
+      }
+      if (terminalStatuses.has(update.status) && agentMessage.timestamp && eventTimestamp) {
+        const startedAt = new Date(agentMessage.timestamp).getTime()
+        const endedAt = new Date(eventTimestamp).getTime()
+        if (Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt) {
+          agentMessage.durationMs = endedAt - startedAt
+        }
+      }
+    }
+
+    return agentMessage
+  }
 
   let current: Turn | null = null
   let currentTurnId: string | null = null
   let currentModel: string | null = metadata.model || null
   let lastTurnTimestamp = ""
+  let pendingCompaction: string | null = null
+  // False until this window has seen a record that starts a turn. Only the
+  // first turn of a window can therefore be a fragment; every later one opens
+  // after a `turn_context` or a user message.
+  let sawTurnStart = false
+
+  function createActiveTurn(turnId: string | null, timestamp: string, model: string | null): Turn {
+    const turn = createTurn(turnId, timestamp, model)
+    if (!sawTurnStart) turn.isFragment = true
+    if (pendingCompaction) {
+      turn.compactionSummary = pendingCompaction
+      pendingCompaction = null
+    }
+    return turn
+  }
+
+  function upsertWebSearchCall(
+    targetTurn: Turn,
+    id: string,
+    input: Record<string, unknown>,
+    status: string,
+    timestamp: string,
+  ) {
+    const existing = webSearchCalls.get(id)
+    if (existing) {
+      existing.input = { ...existing.input, ...input }
+      existing.result = status
+      existing.isError = status === "failed"
+      return
+    }
+
+    const toolCall: ToolCall = {
+      id,
+      name: "WebSearch",
+      input,
+      result: status,
+      isError: status === "failed",
+      timestamp,
+    }
+    webSearchCalls.set(id, toolCall)
+    appendToolCall(targetTurn, toolCall, timestamp)
+  }
 
   for (const record of records) {
     const payload = isObject(record.payload) ? record.payload : undefined
     const timestamp = record.timestamp ?? ""
+
+    if (record.type === "compacted") {
+      current = finalizeTurn(turns, current, lastTurnTimestamp)
+      pendingCompaction = "Conversation compacted"
+      lastTurnTimestamp = timestamp
+      continue
+    }
+
+    // World-state snapshots are model context, not transcript turns.
+    if (record.type === "world_state") continue
 
     if (record.type === "turn_context") {
       current = finalizeTurn(turns, current, lastTurnTimestamp)
       currentTurnId = typeof payload?.turn_id === "string" ? payload.turn_id : null
       currentModel = typeof payload?.model === "string" ? payload.model : currentModel
       lastTurnTimestamp = timestamp
+      sawTurnStart = true
       continue
     }
 
@@ -318,14 +719,29 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
       if (current && (current.assistantText.length > 0 || current.toolCalls.length > 0 || current.thinking.length > 0)) {
         current = finalizeTurn(turns, current, lastTurnTimestamp)
       }
-      current ??= createTurn(currentTurnId, timestamp, currentModel)
-      current.userMessage = payload.message
+      sawTurnStart = true
+      current ??= createActiveTurn(currentTurnId, timestamp, currentModel)
+      const localImages = (Array.isArray(payload.local_images) ? payload.local_images : []).filter(
+        (p): p is string => typeof p === "string" && p.length > 0,
+      )
+      const localAudio = (Array.isArray(payload.local_audio) ? payload.local_audio : []).filter(
+        (p): p is string => typeof p === "string" && p.length > 0,
+      )
+      current.userMessage = buildCodexUserContent(
+        payload.message,
+        extractEventMessageImages(payload),
+        extractEventMessageAudio(payload),
+        localImages,
+        localAudio,
+      )
+      current.isFragment = false
       current.timestamp = current.timestamp || timestamp
       lastTurnTimestamp = timestamp
       continue
     }
 
-    current ??= createTurn(currentTurnId, timestamp, currentModel)
+    if (!current && !recordOpensTurn(record, payload)) continue
+    current ??= createActiveTurn(currentTurnId, timestamp, currentModel)
     if (!current.model && currentModel) current.model = currentModel
     if (!current.timestamp) current.timestamp = timestamp
     if (timestamp) lastTurnTimestamp = timestamp
@@ -336,6 +752,93 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
       if (lastUsage) {
         current.tokenUsage = mergeTokenUsage(current.tokenUsage, lastUsage)
       }
+      continue
+    }
+
+    if (
+      record.type === "event_msg"
+      && payload?.type === "web_search_end"
+      && typeof payload.call_id === "string"
+    ) {
+      const input: Record<string, unknown> = {}
+      if (typeof payload.query === "string" && payload.query) input.query = payload.query
+      if (isObject(payload.action)) input.action = payload.action
+      upsertWebSearchCall(current, payload.call_id, input, "completed", timestamp)
+      continue
+    }
+
+    if (
+      record.type === "event_msg"
+      && payload?.type === "mcp_tool_call_end"
+      && typeof payload.call_id === "string"
+      && isObject(payload.invocation)
+    ) {
+      const invocation = payload.invocation
+      const server = typeof invocation.server === "string" ? invocation.server : "mcp"
+      const tool = typeof invocation.tool === "string" ? invocation.tool : "tool"
+      const input = isObject(invocation.arguments) ? invocation.arguments : {}
+      const result = parseMcpEventResult(payload.result)
+      const existing = pendingToolCalls.get(payload.call_id)
+      if (existing) {
+        existing.result = result.text
+        existing.isError = result.isError
+        pendingToolCalls.delete(payload.call_id)
+      } else if (!isCodeModeChild(payload.call_id)) {
+        appendToolCall(current, {
+          id: payload.call_id,
+          name: `mcp__${server}__${tool}`,
+          input,
+          result: result.text,
+          isError: result.isError,
+          timestamp,
+        }, timestamp)
+      }
+      continue
+    }
+
+    if (
+      record.type === "event_msg"
+      && payload?.type === "sub_agent_activity"
+      && typeof payload.agent_thread_id === "string"
+      && typeof payload.agent_path === "string"
+    ) {
+      const agentId = payload.agent_thread_id
+      const eventId = typeof payload.event_id === "string" ? payload.event_id : ""
+      const kind = typeof payload.kind === "string" ? payload.kind : "started"
+      const spawnInfo = eventId ? spawnAgentCalls.get(eventId) : undefined
+      const existingId = agentIdByPath.get(payload.agent_path)
+      const existing = agentRegistry.get(agentId) ?? (existingId ? agentRegistry.get(existingId) : undefined)
+
+      // An `interacted` event may point back at the parent/root agent. Only a
+      // `started` event (or a previously known agent) establishes a child.
+      if (kind !== "started" && !existing && !spawnInfo) continue
+
+      if (existingId && existingId !== agentId && !agentMessages.has(agentId)) {
+        const provisionalEntry = agentMessages.get(existingId)
+        if (provisionalEntry) {
+          provisionalEntry.message.agentId = agentId
+          agentMessages.delete(existingId)
+          agentMessages.set(agentId, provisionalEntry)
+        }
+        agentRegistry.delete(existingId)
+      }
+
+      const info: AgentInfo = {
+        agentId,
+        nickname: existing?.nickname ?? agentNameFromPath(payload.agent_path) ?? spawnInfo?.taskName ?? null,
+        agentPath: payload.agent_path,
+        message: existing?.message ?? spawnInfo?.message ?? "",
+        model: existing?.model ?? spawnInfo?.model ?? null,
+        agentType: existing?.agentType ?? spawnInfo?.agentType ?? null,
+        timestamp: existing?.timestamp ?? (timestamp || spawnInfo?.timestamp || ""),
+        parentToolCallId: existing?.parentToolCallId ?? eventId,
+      }
+      agentRegistry.set(agentId, info)
+      agentIdByPath.set(payload.agent_path, agentId)
+      if (eventId && (kind === "started" || spawnInfo)) agentIdBySpawnCall.set(eventId, agentId)
+
+      const status = kind === "interrupted" ? "interrupted" : "running"
+      upsertAgentMessage(agentId, current, timestamp, { status })
       continue
     }
 
@@ -356,15 +859,132 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
 
     if (payload.type === "message" && payload.role === "user" && current.userMessage === null) {
       const text = normalizePromptText(extractMessageText(payload, "input_text"))
-      if (text) current.userMessage = text
+      const images = extractResponseMessageImages(payload)
+      const audio = extractResponseMessageAudio(payload)
+      if (text || images.length > 0 || audio.length > 0) {
+        current.userMessage = buildCodexUserContent(text, images, audio)
+        current.isFragment = false
+        sawTurnStart = true
+      }
+      continue
+    }
+
+    if (payload.type === "web_search_call" && typeof payload.id === "string") {
+      const input: Record<string, unknown> = {}
+      if (isObject(payload.action)) input.action = payload.action
+      const status = typeof payload.status === "string" ? payload.status : "completed"
+      upsertWebSearchCall(current, payload.id, input, status, timestamp)
+      continue
+    }
+
+    if (payload.type === "tool_search_call") {
+      const callId = findString(payload.call_id, payload.id) ?? ""
+      if (callId) {
+        const toolCall: ToolCall = {
+          id: callId,
+          name: "ToolSearch",
+          input: isObject(payload.arguments) ? payload.arguments : {},
+          result: null,
+          isError: false,
+          timestamp,
+        }
+        pendingToolCalls.set(callId, toolCall)
+        appendToolCall(current, toolCall, timestamp)
+      }
+      continue
+    }
+
+    if (payload.type === "tool_search_output" && typeof payload.call_id === "string") {
+      const toolCall = pendingToolCalls.get(payload.call_id)
+      if (toolCall) {
+        const tools = Array.isArray(payload.tools) ? payload.tools : []
+        const names = tools
+          .filter(isObject)
+          .map((tool) => findString(tool.name) ?? "")
+          .filter(Boolean)
+        const count = names.length > 0 ? names.length : tools.length
+        const found = `Found ${count} tool${count === 1 ? "" : "s"}`
+        toolCall.result = names.length > 0 ? `${found}: ${names.join(", ")}` : found
+        toolCall.isError = payload.status === "failed"
+        pendingToolCalls.delete(payload.call_id)
+      }
+      continue
+    }
+
+    if (payload.type === "agent_message" && typeof payload.author === "string") {
+      const author = payload.author
+      const recipient = typeof payload.recipient === "string" ? payload.recipient : null
+      const interAgentMessage = extractInterAgentMessage(payload)
+      if (interAgentMessage.messageType === "NEW_TASK") continue
+
+      const knownAgentId = agentIdByPath.get(author)
+      // Outbound root → child routing messages are persisted too. They are not
+      // sub-agent output and must not create a synthetic parent agent. A reply
+      // without its preceding activity record is still recoverable when its
+      // author is a descendant of, and recipient is, this rollout's agent.
+      const isPotentialChild = author.startsWith(`${metadata.agentPath}/`)
+        && (recipient === null || recipient === metadata.agentPath)
+      if (!knownAgentId && !isPotentialChild) continue
+
+      const agentId = knownAgentId ?? author
+      if (!knownAgentId) {
+        agentRegistry.set(agentId, {
+          agentId,
+          nickname: agentNameFromPath(author),
+          agentPath: author,
+          message: "",
+          model: null,
+          agentType: null,
+          timestamp,
+          parentToolCallId: "",
+        })
+        agentIdByPath.set(author, agentId)
+      }
+
+      let status: string | undefined
+      if (interAgentMessage.messageType === "FINAL_ANSWER") status = "completed"
+      else if (interAgentMessage.messageType === "ERROR" || interAgentMessage.messageType === "FAILED") status = "failed"
+      else if (interAgentMessage.messageType === "INTERRUPTED") status = "interrupted"
+      else if (interAgentMessage.messageType === "MESSAGE") status = "running"
+
+      upsertAgentMessage(agentId, current, timestamp, {
+        status,
+        text: interAgentMessage.text || undefined,
+      })
       continue
     }
 
     if (payload.type === "function_call" && typeof payload.call_id === "string") {
+      const rawName = typeof payload.name === "string" ? payload.name : "tool"
+      const functionName = normalizeFunctionName(rawName)
+      const parsedInput = parseToolInput(payload.arguments)
+
+      // Normalize Codex tool names + inputs to Claude Code equivalents
+      let name = functionName
+      let input = parsedInput
+      if (functionName === "exec_command") {
+        name = "Bash"
+      } else if (functionName === "update_plan") {
+        name = "TodoWrite"
+        input = normalizePlanToTodos(parsedInput)
+      }
+
+      // Detect spawn_agent → synthesize sub-agent activity
+      if (functionName === "spawn_agent") {
+        spawnAgentCalls.set(payload.call_id as string, {
+          callId: payload.call_id as string,
+          message: readableAgentPrompt(parsedInput.message),
+          taskName: typeof parsedInput.task_name === "string" ? parsedInput.task_name : null,
+          model: typeof parsedInput.model === "string" ? parsedInput.model : null,
+          agentType: typeof parsedInput.agent_type === "string" ? parsedInput.agent_type : null,
+          timestamp,
+        })
+      }
+
       const toolCall: ToolCall = {
         id: payload.call_id,
-        name: typeof payload.name === "string" ? payload.name : "tool",
-        input: parseToolInput(payload.arguments),
+        name,
+        input,
         result: null,
         isError: false,
         timestamp,
@@ -381,6 +1001,144 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
       toolCall.result = output
       toolCall.isError = inferToolError(output)
       pendingToolCalls.delete(payload.call_id)
+
+      // Resolve spawn_agent result → create sub-agent entry
+      if (toolCall.name === "spawn_agent" && output) {
+        try {
+          const result = JSON.parse(output) as Record<string, unknown>
+          const agentId = typeof result.agent_id === "string"
+            ? result.agent_id
+            : agentIdBySpawnCall.get(toolCall.id) ?? ""
+          const agentPath = typeof result.task_name === "string" ? result.task_name : null
+          const nickname = typeof result.nickname === "string"
+            ? result.nickname
+            : agentPath ? agentNameFromPath(agentPath) : null
+          if (agentId) {
+            const spawnInfo = spawnAgentCalls.get(toolCall.id)
+            const existing = agentRegistry.get(agentId)
+            const info: AgentInfo = {
+              agentId,
+              nickname: nickname ?? existing?.nickname ?? spawnInfo?.taskName ?? null,
+              agentPath: agentPath ?? existing?.agentPath ?? null,
+              message: existing?.message ?? spawnInfo?.message ?? "",
+              model: existing?.model ?? spawnInfo?.model ?? null,
+              agentType: existing?.agentType ?? spawnInfo?.agentType ?? null,
+              timestamp: existing?.timestamp ?? spawnInfo?.timestamp ?? timestamp,
+              parentToolCallId: existing?.parentToolCallId ?? toolCall.id,
+            }
+            agentRegistry.set(agentId, info)
+            agentIdBySpawnCall.set(toolCall.id, agentId)
+            if (info.agentPath) agentIdByPath.set(info.agentPath, agentId)
+            upsertAgentMessage(agentId, current, timestamp, { status: "running" })
+          }
+        } catch { /* skip */ }
+      }
+
+      // Resolve wait_agent result → attach sub-agent messages to turn
+      if (toolCall.name === "wait_agent" && output && current) {
+        try {
+          const result = JSON.parse(output) as Record<string, unknown>
+          const statusMap = isObject(result.status) ? result.status : {}
+          for (const [agentId, status] of Object.entries(statusMap)) {
+            const statusValue = isObject(status) ? status : {}
+            const completedText = typeof statusValue.completed === "string" ? statusValue.completed : ""
+            const failedText = typeof statusValue.failed === "string"
+              ? statusValue.failed
+              : typeof statusValue.error === "string" ? statusValue.error : ""
+            const interruptedText = typeof statusValue.interrupted === "string" ? statusValue.interrupted : ""
+            const lifecycle = completedText
+              ? "completed"
+              : failedText ? "failed"
+                : interruptedText ? "interrupted"
+                  : typeof statusValue.status === "string" ? statusValue.status : "running"
+            if (!agentRegistry.has(agentId)) {
+              agentRegistry.set(agentId, {
+                agentId,
+                nickname: null,
+                agentPath: null,
+                message: "",
+                model: null,
+                agentType: null,
+                timestamp,
+                parentToolCallId: "",
+              })
+            }
+            upsertAgentMessage(agentId, current, timestamp, {
+              status: lifecycle,
+              text: completedText || failedText || interruptedText || undefined,
+            })
+          }
+        } catch { /* skip */ }
+      }
+
+      continue
+    }
+
+    // Handle custom_tool_call (direct apply_patch, exec wrappers, exec_command)
+    if (payload.type === "custom_tool_call" && typeof payload.call_id === "string") {
+      const name = typeof payload.name === "string" ? payload.name : "tool"
+      const rawInput = typeof payload.input === "string" ? payload.input : ""
+      const callId = payload.call_id as string
+      const perFileCalls = rawInput
+        ? parseCodexToolPatches(name, rawInput, callId, timestamp, metadata.cwd)
+        : []
+
+      // Keep the modern exec wrapper visible because it may contain commands or
+      // other nested tools in addition to apply_patch. Direct apply_patch keeps
+      // its legacy presentation as file calls only.
+      if (name !== "apply_patch") {
+        const toolCall: ToolCall = {
+          id: callId,
+          name: name === "exec_command" ? "Bash" : name,
+          input: parseToolInput(rawInput),
+          result: null,
+          isError: false,
+          timestamp,
+        }
+        pendingToolCalls.set(toolCall.id, toolCall)
+        appendToolCall(current, toolCall, timestamp)
+      }
+
+      for (const tc of perFileCalls) {
+        pendingToolCalls.set(tc.id, tc)
+        appendToolCall(current, tc, timestamp)
+      }
+      if (perFileCalls.length > 0) {
+        patchCallIds.set(callId, {
+          calls: perFileCalls,
+          direct: name === "apply_patch",
+        })
+      }
+      continue
+    }
+
+    if (payload.type === "custom_tool_call_output" && typeof payload.call_id === "string") {
+      const callId = payload.call_id as string
+      const { text, isError } = parseCustomToolOutput(payload.output)
+
+      // Check if this is an apply_patch result (maps to multiple per-file calls)
+      const patchCalls = patchCallIds.get(callId)
+      if (patchCalls) {
+        const failedIds = patchCalls.direct && isError
+          ? new Set(patchCalls.calls.map((call) => call.id))
+          : findFailedNestedPatchCallIds(text, isError, patchCalls.calls)
+        for (const patchCall of patchCalls.calls) {
+          const tc = pendingToolCalls.get(patchCall.id)
+          if (tc) {
+            tc.result = text
+            tc.isError = failedIds.has(tc.id)
+            pendingToolCalls.delete(tc.id)
+          }
+        }
+        patchCallIds.delete(callId)
+      }
+
+      const toolCall = pendingToolCalls.get(callId)
+      if (toolCall) {
+        toolCall.result = text
+        toolCall.isError = isError
+        pendingToolCalls.delete(callId)
+      }
       continue
     }
   }
@@ -393,10 +1151,13 @@ export function parseCodexSession(jsonlText: string): ParsedSession {
     gitBranch: metadata.gitBranch,
     cwd: metadata.cwd,
     slug: metadata.slug,
+    name: "",
     model: metadata.model,
     turns,
-    stats: computeStats(turns),
-    rawMessages: records as Array<{ type: string; [key: string]: unknown }>,
+    stats: options?.skipStats ? createEmptySessionStats(turns.length) : computeStats(turns),
+    rawMessages: options?.skipStats
+      ? []
+      : records as Array<{ type: string; [key: string]: unknown }>,
     branchedFrom: metadata.branchedFrom,
     agentKind: "codex" as const,
   }

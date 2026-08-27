@@ -1,3 +1,4 @@
+// SHARED SESSION CORE: edit shared/session only; cogpit-memory copies are generated.
 /**
  * Interactive prompt detection — plan approval and user question states.
  */
@@ -13,6 +14,7 @@ export interface PlanApprovalState {
 
 export interface UserQuestionState {
   type: "question"
+  toolUseId: string
   questions: Array<{
     question: string
     header?: string
@@ -26,14 +28,35 @@ export type PendingInteraction = PlanApprovalState | UserQuestionState | null
 // ── Detection ────────────────────────────────────────────────────────────────
 
 /**
- * Check if the previous turn's last tool call is the same interactive tool
- * with a pending/error result -- indicates a stuck loop we should suppress.
+ * Check if the previous turn's last tool call is the same interactive tool that
+ * *errored* -- indicates a stuck re-call loop we should suppress.
+ *
+ * An unanswered (result === null) prompt in the previous turn is NOT a loop:
+ * it just means the user replied with a message instead of answering, and the
+ * agent is now asking again. Treating that as stuck suppressed the current
+ * prompt entirely, leaving the turn blocked with no way to answer it.
  */
 export function isStuckInteractiveLoop(turns: Turn[], toolName: string): boolean {
   if (turns.length < 2) return false
   const prevTurn = turns[turns.length - 2]
   const prevLastTC = prevTurn.toolCalls[prevTurn.toolCalls.length - 1]
-  return prevLastTC?.name === toolName && (prevLastTC.result === null || prevLastTC.isError)
+  return prevLastTC?.name === toolName && prevLastTC.isError
+}
+
+/**
+ * Check whether the turn contains assistant content (text/thinking/tool calls)
+ * chronologically after the block holding the given tool call — meaning the
+ * agent already moved past it and the prompt is no longer answerable.
+ */
+function agentContinuedAfterToolCall(turn: Turn, toolCallId: string): boolean {
+  const blocks = turn.contentBlocks
+  const blockIndex = blocks.findIndex(
+    (block) => block.kind === "tool_calls" && block.toolCalls.some((tc) => tc.id === toolCallId),
+  )
+  if (blockIndex === -1) return false
+  return blocks.slice(blockIndex + 1).some(
+    (block) => block.kind === "text" || block.kind === "thinking" || block.kind === "tool_calls",
+  )
 }
 
 /**
@@ -59,6 +82,12 @@ export function detectPendingInteraction(session: ParsedSession): PendingInterac
   // Suppress if the agent is stuck re-calling the same interactive tool
   if (isStuckInteractiveLoop(turns, name)) return null
 
+  // If the tool call errored and the agent kept going (more assistant content
+  // after it in the same turn), the prompt is dead — e.g. AskUserQuestion
+  // failed instantly and the agent fell back to plain text. A genuinely
+  // pending prompt blocks the turn, so nothing can follow it.
+  if (lastToolCall.isError && agentContinuedAfterToolCall(lastTurn, lastToolCall.id)) return null
+
   const input = lastToolCall.input as Record<string, unknown>
 
   if (name === "ExitPlanMode") {
@@ -71,7 +100,7 @@ export function detectPendingInteraction(session: ParsedSession): PendingInterac
   // AskUserQuestion
   const questions = input.questions as UserQuestionState["questions"] | undefined
   if (questions && questions.length > 0) {
-    return { type: "question", questions }
+    return { type: "question", toolUseId: lastToolCall.id, questions }
   }
 
   return null
