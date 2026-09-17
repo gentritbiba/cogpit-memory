@@ -163,7 +163,7 @@ export interface UserMessage extends BaseMessage {
   origin?: { kind?: string } | null
   permissionMode?: string
   thinkingMetadata?: { maxThinkingTokens: number }
-  toolUseResult?: AgentToolUseResult
+  toolUseResult?: Partial<AgentToolUseResult> & { staged?: boolean; bashEditDiff?: unknown }
   sourceToolAssistantUUID?: string
 }
 
@@ -249,6 +249,8 @@ export type HookEventName =
   | "SubagentStop"
   | "PreCompact"
   | "PostCompact"
+  | "PreModelSwitch"
+  | "PostModelSwitch"
   | "PermissionDenied"
   | "TaskCreated"
   | "WorktreeCreate"
@@ -431,6 +433,11 @@ export type RawMessage =
 
 // ── Parsed Structures ───────────────────────────────────────────────────────
 
+export interface ToolFileDiff {
+  filePath: string
+  hunks: Array<{ oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }>
+}
+
 export interface ToolCall {
   id: string
   name: string
@@ -439,6 +446,11 @@ export interface ToolCall {
   /** Binary images returned by a tool, when the provider persists them. */
   resultImages?: ImageBlock[]
   isError: boolean
+  awaitingReview?: boolean
+  fileDiffs?: ToolFileDiff[]
+  additionalFileDiffs?: number
+  /** Counts from one structured file diff, before combining it with later edits. */
+  diffLineCounts?: { add: number; del: number }
   timestamp: string
   /**
    * A question whose tool result is only an acceptance receipt. Codex's
@@ -616,6 +628,8 @@ export interface ArchivedToolCall {
 
 export interface ArchivedTurn {
   index: number
+  /** The archived turn's `Turn.id`. Absent on archives written before ids were kept. */
+  id?: string
   userMessage: string | null
   toolCalls: ArchivedToolCall[]
   thinkingBlocks: string[]
@@ -627,7 +641,14 @@ export interface ArchivedTurn {
 export interface Branch {
   id: string
   createdAt: string
+  /**
+   * Position of the fork turn among the turns loaded when this was written.
+   * Only a long session's tail is loaded, so it is re-resolved from
+   * `branchPointTurnId` on every read and trusted as stored only without one.
+   */
   branchPointTurnIndex: number
+  /** `Turn.id` of the last turn kept before the fork; null when none was kept. */
+  branchPointTurnId?: string | null
   label: string
   turns: ArchivedTurn[]
   jsonlLines: string[]
@@ -637,8 +658,6 @@ export interface Branch {
 
 export interface UndoState {
   sessionId: string
-  currentTurnIndex: number
-  totalTurns: number
   branches: Branch[]
   activeBranchId: string | null
 }
