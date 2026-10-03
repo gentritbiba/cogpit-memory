@@ -260,6 +260,8 @@ export interface AgentConfigFile {
   readonly scopes: readonly AgentConfigScope[]
   /** Tree label; defaults to `path`. */
   readonly label?: string
+  /** Read only when none of the agent's other instruction files exist at that scope. */
+  readonly fallback?: true
 }
 
 /**
@@ -634,6 +636,7 @@ const claude: AgentDescriptor = {
     instructions: [
       { in: "scope", path: "CLAUDE.md", scopes: ["global", "project"] },
       { in: "root", path: "CLAUDE.md", label: ".claude/CLAUDE.md", scopes: ["project"] },
+      { in: "scope", path: "AGENTS.md", scopes: ["project"], fallback: true },
     ],
     settings: [
       { in: "root", path: "settings.json", scopes: ["global"] },
